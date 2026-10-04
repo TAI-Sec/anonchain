@@ -1,0 +1,33 @@
+# ANONCHAIN v1.0 default config. Copy to ~/.anonchain/config.toml to override.
+
+[general]
+proxy_file = "proxy.txt"
+working_file = "working_proxies.txt"
+log_dir = "~/.anonchain/logs"
+workers = 40
+local_port = 9050
+chain_hops = 3
+use_doh = true
+use_udp = false
+health_interval = 60
+auto_scrape = false
+auto_failover = true
+
+[tor]
+socks_port = 9051
+control_port = 9052
+auto_start = false
+
+[dns]
+bridge_port = 5353
+auto_start = true
+
+[killswitch]
+auto_arm = false
+
+[netns]
+name = "anonchain"
+table = "100"
+
+[profiles]
+# user profiles saved here

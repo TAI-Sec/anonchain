@@ -1,0 +1,38 @@
+# ---- secrets / user data ----
+proxy.txt
+working_proxies.txt
+config.toml
+config.default.toml.bak
+sessions.db
+sessions.db-wal
+sessions.db-shm
+*.session
+anonchain-proxy-backup.txt
+
+# ---- compiled ----
+*.so
+*.o
+*.pyc
+__pycache__/
+*.py[cod]
+
+# ---- runtime ----
+logs/
+*.log
+*.pid
+*.port
+
+# ---- editor ----
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- venv ----
+venv/
+env/
+.venv/

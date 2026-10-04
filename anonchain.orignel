@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""ANONCHAIN v1.0 — chain proxy interface + tool launcher (portable)."""
+import os, sys, time, random, threading, subprocess, socket, platform
+from pathlib import Path
+from datetime import datetime
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+
+# ─── resolve our own dir FIRST so imports work from anywhere ───
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+# ─── deps ───
+REQ = {"rich": "rich", "requests": "requests",
+       "urllib3": "urllib3", "psutil": "psutil"}
+def _has(m):
+    try: __import__(m); return True
+    except ImportError: return False
+def _boot_deps():
+    miss = [p for p, m in REQ.items() if not _has(m)]
+    if miss:
+        print(f"[*] installing: {' '.join(miss)}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *miss,
+                               "--quiet", "--disable-pip-version-check"])
+_boot_deps()
+
+if os.name != "posix":
+    print("[!] Linux/Unix required."); sys.exit(1)
+
+import psutil, requests, urllib3
+from rich.console import Console
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.live import Live
+from rich.table import Table
+from rich.text import Text
+from rich import box
+import termios, tty, select
+
+# ─── local modules ───
+import paths
+from paths import (
+    HOME_DIR, CONFIG_FILE, DB_FILE, LOG_DIR,
+    PROXY_FILE, WORKING_FILE, PORT_FILE,
+    ensure_home, migrate_legacy,
+)
+from chain_engine import ChainProxyServer, parse_hop
+from killswitch import KillSwitch
+from doh import DoHResolver
+from dns_bridge import DNSBridge
+from tor_manager import TorManager
+from scraper import Scraper
+from health import HealthMonitor
+from profiles import Profiles
+from session_db import SessionDB
+from netns import NetNS
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ─── ensure home tree exists ───
+ensure_home()
+migrate_legacy()
+
+APP, VER = "ANONCHAIN", "1.0"
+LOG_MAX = 800; FPS = 30
+DEFAULT_PORT = 9050
+
+C = {"prim":"bright_cyan","acc":"bright_magenta","ok":"bright_green",
+     "warn":"bright_yellow","err":"bright_red","dim":"grey50","hi":"bright_white"}
+G = {"spin":"⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏","dots":"⣾⣽⣻⢿⡿⣟⣯⣷",
+     "pulse":"▁▂▃▄▅▆▇█▇▆▅▄▃▂"}
+GLITCH = "!<>-_\\/[]{}—=+*^?#________"
+
+
+# ═══════════════════════════════════════════════════════════════
+class State:
+    def __init__(self, profiles):
+        self.lock = threading.Lock()
+        self.log = deque(maxlen=LOG_MAX)
+        self.tick = 0; self.boot_time = time.time()
+        self.proxies = []; self.working = []
+        self.tested = self.failed = 0; self.total_to_test = 0
+
+        self.chain_hops = profiles.get("general", "chain_hops", 3)
+        self.chain_active = False; self.chain_strings = []; self.chain_server = None
+        self.local_port = profiles.get("general", "local_port", DEFAULT_PORT)
+        self.workers = profiles.get("general", "workers", 40)
+        self.use_doh = profiles.get("general", "use_doh", True)
+        self.use_udp = profiles.get("general", "use_udp", False)
+        self.use_preload = False; self.transparent = False
+        self.kill_switch = False
+
+        self.hostname = socket.gethostname()
+        self.local_ip = "…"; self.public_ip = "…"
+        self.os_info = f"{platform.system()} {platform.release()}"
+        try: self.local_ip = socket.gethostbyname(self.hostname)
+        except Exception: pass
+
+        self.task_running = False; self.should_quit = False
+        self.profiles = profiles
+
+        self.doh = DoHResolver(on_event=self.engine_event)
+        self.dns_bridge = DNSBridge(
+            self.doh, host="127.0.0.1",
+            port=profiles.get("dns", "bridge_port", 5353),
+            on_event=self.engine_event)
+        self.tor = TorManager(
+            socks_port=profiles.get("tor", "socks_port", 9051),
+            control_port=profiles.get("tor", "control_port", 9052),
+            on_event=self.engine_event)
+        self.scraper = Scraper(on_event=self.engine_event)
+        self.kill = KillSwitch([], on_event=self._ks_event)
+        self.netns = NetNS(port=self.local_port, on_event=self.engine_event)
+        self.session = SessionDB(on_event=self.engine_event)
+        self.health = HealthMonitor(
+            self, interval=profiles.get("general", "health_interval", 60),
+            on_event=self.engine_event)
+
+    def _ks_event(self, lvl, msg): self.log_msg(lvl, f"[KS] {msg}")
+
+    def log_msg(self, lvl, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        with self.lock: self.log.append((ts, lvl, msg))
+        try: self.session.log_event(lvl, msg)
+        except Exception: pass
+
+    def engine_event(self, lvl, msg): self.log_msg(lvl, f"[CHN] {msg}")
+
+
+# ═══════════════════════════════════════════════════════════════
+class KeyReader:
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+    def start(self):
+        tty.setcbreak(self.fd)
+        n = termios.tcgetattr(self.fd)
+        n[3] &= ~(termios.ECHO | termios.ICANON)
+        termios.tcsetattr(self.fd, termios.TCSANOW, n)
+    def stop(self): termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+    def read(self, t=0.03):
+        r, _, _ = select.select([self.fd], [], [], t)
+        if not r: return None
+        b = os.read(self.fd, 1)
+        if b == b"\x1b":
+            r2, _, _ = select.select([self.fd], [], [], 0.02)
+            if r2: return (b + os.read(self.fd, 2)).decode("latin-1")
+            return "\x1b"
+        return b.decode("latin-1", "ignore")
+
+
+# ═══════════════════════════════════════════════════════════════
+class AnonChain:
+    def __init__(self):
+        self.console = Console()
+        self.profiles = Profiles(on_event=lambda l, m: None)
+        self.state = State(self.profiles)
+        self.kr = KeyReader()
+        self.menu_idx = 0
+        self.menu = [
+            ("Probe Proxy Swarm",    self.cmd_test),
+            ("Scrape Fresh Proxies", self.cmd_scrape),
+            ("Persist Working Set",  self.cmd_save),
+            ("Assemble Chain",       self.cmd_build),
+            ("Teardown Chain",       self.cmd_stop),
+            ("Toggle Kill-Switch",   self.cmd_kill),
+            ("Toggle Transparent",   self.cmd_transparent),
+            ("Start DNS Bridge",     self.cmd_dns),
+            ("Stop DNS Bridge",      self.cmd_dns_stop),
+            ("Start Tor",            self.cmd_tor_start),
+            ("New Tor Circuit",      self.cmd_tor_new),
+            ("Stop Tor",             self.cmd_tor_stop),
+            ("Start Health Monitor", self.cmd_health),
+            ("Stop Health Monitor",  self.cmd_health_stop),
+            ("New Session",          self.cmd_session),
+            ("Export Session",       self.cmd_export),
+            ("Save Profile",         self.cmd_save_profile),
+            ("Load Profile",         self.cmd_load_profile),
+            ("Reload proxy.txt",     self.cmd_reload),
+            ("Flush Logs",           self.cmd_clear),
+            ("Open Config Dir",      self.cmd_open_dir),
+            ("Terminate",            self.cmd_quit),
+        ]
+        self.boot_msgs = deque(maxlen=10); self.boot_progress = 0.0
+        self._load_proxies()
+        threading.Thread(target=self._fetch_ip, daemon=True).start()
+        if self.profiles.get("dns", "auto_start", True):
+            threading.Thread(target=self.cmd_dns, daemon=True).start()
+
+    # ── boot ──
+    def boot_sequence(self):
+        lines = [
+            ("INFO", f"Home dir          ... {HOME_DIR}"),
+            ("INFO", f"Config            ... {CONFIG_FILE.name}"),
+            ("OK",   f"Python runtime    ... {platform.python_version()}"),
+            ("OK",   f"Host              ... {self.state.hostname}"),
+            ("INFO", "Chain engine      ... HTTP/SOCKS5/UDP ready"),
+            ("INFO", "DoH resolver      ... ready"),
+            ("INFO", "Tor manager       ... " +
+                    ("ready" if self.state.tor.available() else "tor missing")),
+            ("INFO", "Kill-switch       ... loaded"),
+            ("OK",   f"Proxies           ... {len(self.state.proxies)} endpoints"),
+            ("OK",   "UI shell v1.0     ... ready"),
+        ]
+        self.console.clear()
+        with Live(self._boot_render(), console=self.console,
+                  refresh_per_second=FPS, screen=True) as live:
+            for i, (lvl, msg) in enumerate(lines):
+                self.boot_msgs.append((lvl, msg))
+                for _ in range(8):
+                    self.state.tick += 1
+                    self.boot_progress = (i + 1) / len(lines)
+                    live.update(self._boot_render()); time.sleep(1 / FPS)
+            for _ in range(FPS):
+                self.state.tick += 1
+                live.update(self._boot_render()); time.sleep(1 / FPS)
+
+    def _boot_render(self):
+        s = self.state; t = s.tick
+        prog = min(1.0, (time.time() - s.boot_time) / 1.5)
+        title = self._scr(f"◤ {APP} v{VER} ◢", prog)
+        sub = self._scr("c h a i n   p r o x y   i n t e r f a c e", prog)
+        bar = self._pulse(t, 56)
+        rows = []
+        for lvl, m in self.boot_msgs:
+            col = {"INFO": C["prim"], "OK": C["ok"], "WARN": C["warn"],
+                   "ERR": C["err"]}.get(lvl, "white")
+            rows.append(f"[{col}]{lvl:<4}[/] [dim]›[/] {m}")
+        pct = int(self.boot_progress * 100); f = int(self.boot_progress * 40)
+        pbar = f"[{C['ok']}]{'█'*f}[/][{C['dim']}]{'░'*(40-f)}[/]"
+        left = Text.from_markup(
+            f"\n[bold {C['prim']}]{title}[/]\n[{C['dim']}]{sub}[/]\n\n"
+            f"[{C['acc']}]{bar}[/]\n\n" + "\n".join(rows) +
+            f"\n\n  {pbar}  [bold {C['hi']}]{pct}%[/]\n")
+        rain = "\n".join(f"[{C['dim']}]{self._rain(t+y, 34)}[/]" for y in range(18))
+        g = Table.grid(expand=True, padding=(0, 2))
+        g.add_column(ratio=3); g.add_column(ratio=1)
+        g.add_row(left, Text.from_markup(rain))
+        return Panel(g, border_style=C["prim"], box=box.HEAVY, padding=(1, 3))
+
+    @staticmethod
+    def _rain(t, w):
+        pool = "アカサタナハマヤラワイキシチニヒミリ0123456789"
+        return "".join(random.choice(pool) for _ in range(w))
+
+    @staticmethod
+    def _pulse(t, w):
+        g = G["pulse"]; n = len(g); idx = (t // 2) % (2 * n - 2)
+        if idx >= n: idx = 2 * n - 2 - idx
+        return "".join(
+            g[max(0, n - 1 - int(abs(i - (w * idx / (n - 1)))))] for i in range(w))
+
+    @staticmethod
+    def _scr(text, progress, rate=0.4):
+        reveal = int(len(text) * progress); out = []
+        for i, ch in enumerate(text):
+            if i < reveal or ch == " ": out.append(ch)
+            elif random.random() < rate: out.append(random.choice(GLITCH))
+            else: out.append(ch)
+        return "".join(out)
+
+    # ── proxy file I/O (home dir) ──
+    def _proxy_path(self):
+        return self.profiles.get_path("general", "proxy_file", PROXY_FILE)
+
+    def _working_path(self):
+        return self.profiles.get_path("general", "working_file", WORKING_FILE)
+
+    def _load_proxies(self):
+        s = self.state
+        pf = self._proxy_path()
+        if not pf.exists():
+            try:
+                pf.parent.mkdir(parents=True, exist_ok=True)
+                pf.write_text("# ANONCHAIN proxy list — ip:port per line\n")
+            except Exception as e:
+                s.log_msg("ERR", f"cannot create {pf}: {e}"); return
+            s.log_msg("WARN", f"created empty {pf}"); return
+        try:
+            raw = [l.strip() for l in pf.read_text().splitlines()
+                   if l.strip() and not l.lstrip().startswith("#")]
+            s.proxies = [l for l in raw if ":" in l]
+            s.log_msg("OK", f"loaded {len(s.proxies)} endpoints from {pf}")
+        except Exception as e:
+            s.log_msg("ERR", f"load {pf}: {e}")
+
+    def _fetch_ip(self):
+        try:
+            r = requests.get("http://api.ipify.org", timeout=6)
+            self.state.public_ip = r.text.strip()
+            self.state.log_msg("OK", f"public ip {self.state.public_ip}")
+        except Exception:
+            self.state.public_ip = "unavailable"
+
+    # ── panels ──
+    def _hdr(self):
+        s = self.state; t = s.tick
+        sp = G["spin"][t % len(G["spin"])]
+        title = f"[bold {C['prim']}]◤ {APP} ◢[/] [dim]v{VER}[/]"
+        mode = (f"[{C['dim']}]MODE[/] [bold {C['warn']}]"
+                f"{'busy' if s.task_running else 'idle':<8}[/]")
+        st = (f"[{C['dim']}]STATUS[/] [bold {C['ok']}]"
+              f"{'ACTIVE' if s.chain_active else 'READY'}[/]")
+        right = (f"[{C['acc']}]{sp}[/] "
+                 f"[{C['dim']}]port {s.local_port}[/] "
+                 f"[{C['dim']}]up {int(time.time()-s.boot_time)}s[/]")
+        line = f"{title} [{C['dim']}]│[/] {mode} [{C['dim']}]│[/] {st}"
+        g = Table.grid(expand=True)
+        g.add_column(justify="left"); g.add_column(justify="right")
+        g.add_row(Text.from_markup(line), Text.from_markup(right))
+        return Panel(g, style=C["prim"], box=box.HEAVY, height=3, padding=(0, 1))
+
+    def _controller(self):
+        s = self.state; t = s.tick; out = []
+        visible = self.menu[:11]
+        for i, (name, _) in enumerate(visible):
+            if i == self.menu_idx:
+                b = "▶" if (t // 8) % 2 == 0 else "▷"
+                out.append(f"[black on {C['prim']}]  {b} {i+1:>2}. {name:<22}[/]")
+            else:
+                out.append(f"[{C['hi']}]    {i+1:>2}. {name:<22}[/]")
+        if len(self.menu) > 11:
+            extra = self.menu_idx >= 11
+            tag = f"[{C['dim']}]…+{len(self.menu)-11} more[/]"
+            out.append(tag + (" [yellow](active)[/]" if extra else ""))
+        out += ["", f"[{C['dim']}]↑↓ Enter · 1-9 0 · k r c t n q[/]", "",
+                f"[{C['dim']}]work [/][b]{s.workers}[/] "
+                f"[{C['dim']}]hops [/][b]{s.chain_hops}[/]",
+                f"[{C['dim']}]loaded [/][b]{len(s.proxies)}[/] "
+                f"[{C['dim']}]work [/][b {C['ok']}]{len(s.working)}[/]"]
+        if s.task_running and s.total_to_test:
+            d = s.tested + s.failed; w = 24
+            f = int(w * d / max(1, s.total_to_test))
+            out += ["", f"[{C['dim']}]probe[/] [{C['ok']}]{'█'*f}[/]"
+                        f"[{C['dim']}]{'░'*(w-f)}[/] "
+                        f"[b]{int(100*d/max(1,s.total_to_test))}%[/]"]
+        return Panel("\n".join(out),
+                     title=f"[bold {C['prim']}]CONTROLLER[/]",
+                     border_style=C["prim"], box=box.ROUNDED)
+
+    def _system(self):
+        s = self.state
+        cpu = psutil.cpu_percent(interval=None); mem = psutil.virtual_memory()
+        net = psutil.net_io_counters(); w = 14
+        cb = (f"[{C['ok']}]{'▰'*int(cpu/100*w)}[/]"
+              f"[{C['dim']}]{'▱'*(w-int(cpu/100*w))}[/]")
+        mb = (f"[{C['acc']}]{'▰'*int(mem.percent/100*w)}[/]"
+              f"[{C['dim']}]{'▱'*(w-int(mem.percent/100*w))}[/]")
+        tb = Table.grid(padding=(0, 1))
+        tb.add_column(style=C["dim"], width=11); tb.add_column(style=C["hi"])
+        tb.add_row("host", s.hostname); tb.add_row("os", s.os_info)
+        tb.add_row("local", s.local_ip)
+        tb.add_row("public", f"[b {C['ok']}]{s.public_ip}[/]")
+        tb.add_row("cpu", f"{cpu:5.1f}%  {cb}")
+        tb.add_row("ram", f"{mem.percent:5.1f}%  {mb}")
+        tb.add_row("net ↑/↓", f"{net.bytes_sent//1048576}M/{net.bytes_recv//1048576}M")
+        tb.add_row("uptime", f"{int(time.time()-s.boot_time)}s")
+        tb.add_row("home", f"[{C['dim']}]{HOME_DIR}[/]")
+        tb.add_row("tested", f"[{C['ok']}]{s.tested}[/]/[{C['err']}]{s.failed}[/]")
+        tb.add_row("preload", f"[b {C['acc']}]ON[/]" if s.use_preload
+                   else f"[{C['dim']}]off[/]")
+        return Panel(tb, title=f"[bold {C['acc']}]SYSTEM[/]",
+                     border_style=C["acc"], box=box.ROUNDED)
+
+    def _chain(self):
+        s = self.state; t = s.tick
+        st = (f"[b {C['ok']}]◉ ACTIVE[/]" if s.chain_active
+              else f"[b {C['err']}]○ INACTIVE[/]")
+        tb = Table.grid(padding=(0, 1))
+        tb.add_column(style=C["dim"], width=11); tb.add_column(style=C["hi"])
+        tb.add_row("chain", st); tb.add_row("hops", str(s.chain_hops))
+        tb.add_row("bind", f"127.0.0.1:{s.local_port}")
+        if s.chain_strings:
+            path = " → ".join(x.split(":")[0] for x in s.chain_strings[:4])
+            tb.add_row("path", f"[{C['prim']}]{path}[/]")
+        else:
+            tb.add_row("path", f"[{C['dim']}]—[/]")
+        stats = s.chain_server.stats if s.chain_server else {}
+        tb.add_row("", "")
+        tb.add_row("conns", str(stats.get("connections", 0)))
+        tb.add_row("http/socks", f"{stats.get('http',0)}/{stats.get('socks5',0)}")
+        tb.add_row("failovers", str(stats.get("failovers", 0)))
+        tb.add_row("bytes", f"{stats.get('bytes_c2u',0)//1024}K↑ "
+                           f"{stats.get('bytes_u2c',0)//1024}K↓")
+        tb.add_row("", "")
+        tb.add_row("doh", f"[b {C['ok']}]ON[/]" if s.use_doh
+                    else f"[{C['dim']}]off[/]")
+        tb.add_row("dns-bridge", f"[b {C['ok']}]on[/]" if s.dns_bridge.running
+                    else f"[{C['dim']}]off[/]")
+        tb.add_row("tor", f"[b {C['ok']}]running[/]" if s.tor.running
+                    else f"[{C['dim']}]stopped[/]")
+        tb.add_row("health", f"[b {C['ok']}]on[/]" if s.health.running
+                    else f"[{C['dim']}]off[/]")
+        tb.add_row("transp", f"[b {C['warn']}]ACTIVE[/]" if s.transparent
+                    else f"[{C['dim']}]off[/]")
+        tb.add_row("kill-sw", f"[b {C['err']}]▣ ARMED[/]" if s.kill_switch
+                    else f"[{C['ok']}]▢ off[/]")
+        pulse = "".join(f"[{C['acc'] if (t//4+i)%2 else C['dim']}]◆[/]"
+                        for i in range(6))
+        tb.add_row("phase", f"{pulse} [dim]1.0[/]")
+        return Panel(tb, title=f"[bold {C['warn']}]CHAIN ▸ RELAY[/]",
+                     border_style=C["warn"], box=box.ROUNDED)
+
+    def _debugger(self):
+        s = self.state; t = s.tick
+        with s.lock: logs = list(s.log)[-16:]
+        cm = {"INFO": C["prim"], "OK": C["ok"], "WARN": C["warn"],
+              "ERR": C["err"], "DBG": C["dim"]}
+        rows = []
+        for ts, lvl, m in logs:
+            rows.append(f"[{C['dim']}]{ts}[/] "
+                        f"[{cm.get(lvl,'white')}]{lvl:<4}[/] {m}")
+        while len(rows) < 16: rows.insert(0, "")
+        ks = (f"[b {C['err']}]▣ KILL-SWITCH ARMED[/]" if s.kill_switch
+              else f"[{C['ok']}]▢ kill-switch off[/]")
+        sp = G["dots"][t % len(G["dots"])]
+        title = (f"[b {C['err']}]DEBUGGER[/] [{C['dim']}]│[/] {ks} "
+                 f"[{C['dim']}]│[/] [{C['prim']}]{sp}[/]")
+        return Panel("\n".join(rows), title=title,
+                     border_style=C["err"], box=box.ROUNDED)
+
+    def _render(self):
+        self.state.tick += 1
+        l = Layout()
+        l.split_column(
+            Layout(self._hdr(), name="h", size=3),
+            Layout(name="top", ratio=1),
+            Layout(self._debugger(), name="d", ratio=1))
+        l["top"].split_row(
+            Layout(self._controller(), name="l", ratio=1),
+            Layout(self._system(), name="m", ratio=1),
+            Layout(self._chain(), name="r", ratio=1))
+        return l
+
+    # ══════════════════ commands ══════════════════
+    def cmd_test(self):
+        s = self.state
+        if s.task_running: s.log_msg("WARN", "task in flight"); return
+        if not s.proxies: s.log_msg("ERR", "no proxies"); return
+        s.task_running = True; s.tested = s.failed = 0; s.working = []
+        s.total_to_test = len(s.proxies)
+        s.log_msg("INFO", f"probing {s.total_to_test} @ {s.workers} workers")
+        def probe(p):
+            cfg = {"http": f"http://{p}", "https": f"http://{p}"}
+            try:
+                r = requests.get("http://httpbin.org/ip", proxies=cfg,
+                                 timeout=8, verify=False)
+                if r.status_code == 200:
+                    with s.lock: s.working.append(p); s.tested += 1
+                    s.log_msg("OK", f"{p} 200"); return
+            except Exception: pass
+            with s.lock: s.failed += 1
+            s.log_msg("ERR", f"{p} fail")
+        with ThreadPoolExecutor(max_workers=s.workers) as ex:
+            list(ex.map(probe, s.proxies))
+        s.log_msg("OK", f"done {s.tested} ok / {s.failed} fail")
+        s.task_running = False
+
+    def cmd_scrape(self):
+        s = self.state
+        if s.task_running: s.log_msg("WARN", "task in flight"); return
+        s.task_running = True; s.log_msg("INFO", "scraping sources…")
+        try:
+            found = s.scraper.fetch_all()
+            good = s.scraper.validate(found, workers=100)
+            good.sort(key=lambda x: x[1])
+            with s.lock:
+                s.proxies = list({p for p, _ in good} | set(s.proxies))
+                s.working = [p for p, _ in good][:200]
+            pf = self._proxy_path()
+            pf.write_text("\n".join(s.proxies) + "\n")
+            s.log_msg("OK", f"saved {len(s.proxies)} → {pf}")
+        except Exception as e: s.log_msg("ERR", f"scrape: {e}")
+        s.task_running = False
+
+    def cmd_save(self):
+        s = self.state
+        if not s.working: s.log_msg("WARN", "working set empty"); return
+        wf = self._working_path()
+        try:
+            wf.write_text("\n".join(s.working) + "\n")
+            s.log_msg("OK", f"saved {len(s.working)} → {wf}")
+        except Exception as e: s.log_msg("ERR", f"save: {e}")
+
+    def cmd_build(self):
+        s = self.state
+        if s.chain_active: s.log_msg("WARN", "chain active"); return
+        pool = s.working or s.proxies
+        if not pool: s.log_msg("ERR", "no endpoints"); return
+        s.chain_hops = min(s.chain_hops, len(pool))
+        chosen = pool[:s.chain_hops]
+        hops = []
+        for line in chosen:
+            try: hops.append(parse_hop(line))
+            except Exception as e: s.log_msg("ERR", f"bad hop {line}: {e}")
+        if not hops: s.log_msg("ERR", "no valid hops"); return
+        port = s.local_port
+        for _ in range(30):
+            try:
+                t = socket.socket()
+                t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                t.bind(("127.0.0.1", port)); t.close(); break
+            except OSError: port += 1
+        else: s.log_msg("ERR", "no free port"); return
+        fp = []
+        for line in pool[s.chain_hops:s.chain_hops + 30]:
+            try: fp.append(parse_hop(line))
+            except Exception: pass
+        srv = ChainProxyServer(hops, port=port, on_event=s.engine_event,
+                               doh=s.doh if s.use_doh else None,
+                               udp=s.use_udp, failover_pool=fp)
+        try: srv.start()
+        except Exception as e: s.log_msg("ERR", f"chain start: {e}"); return
+        s.chain_server = srv; s.chain_strings = chosen; s.chain_active = True
+        s.local_port = port
+        try: PORT_FILE.write_text(str(port))
+        except Exception: pass
+        s.log_msg("OK", "chain: " + " → ".join(h.host for h in hops))
+        s.kill.allow_ips = [h.host for h in hops]
+        if self.profiles.get("killswitch", "auto_arm", False):
+            ok, msg = s.kill.arm()
+            if ok: s.kill_switch = True
+            s.log_msg("OK" if ok else "ERR", msg)
+        s.session.start_session(name=f"chain-{int(time.time())}")
+
+    def cmd_stop(self):
+        s = self.state
+        if not s.chain_active: s.log_msg("WARN", "not active"); return
+        if s.chain_server:
+            try: s.chain_server.stop()
+            except Exception: pass
+        s.chain_server = None; s.chain_active = False; s.chain_strings = []
+        try: PORT_FILE.unlink()
+        except Exception: pass
+        s.log_msg("OK", "chain torn down")
+
+    def cmd_kill(self):
+        s = self.state
+        if s.kill_switch:
+            ok, msg = s.kill.disarm(); s.kill_switch = False
+            s.log_msg("OK" if ok else "ERR", msg)
+        else:
+            ok, msg = s.kill.arm()
+            if ok: s.kill_switch = True
+            s.log_msg("WARN" if ok else "ERR", msg)
+
+    def cmd_transparent(self):
+        s = self.state
+        if s.transparent: s.netns.stop(); s.transparent = False
+        else:
+            if s.netns.start(): s.transparent = True
+
+    def cmd_dns(self):
+        s = self.state
+        if s.dns_bridge.running: s.log_msg("WARN", "dns bridge already up"); return
+        s.dns_bridge.start()
+
+    def cmd_dns_stop(self):
+        s = self.state
+        if not s.dns_bridge.running: s.log_msg("WARN", "dns bridge down"); return
+        s.dns_bridge.stop()
+
+    def cmd_tor_start(self):
+        s = self.state
+        if not s.tor.available():
+            s.log_msg("ERR", "tor missing — apt install tor"); return
+        threading.Thread(target=s.tor.start, kwargs={"wait": True},
+                         daemon=True).start()
+
+    def cmd_tor_new(self):
+        s = self.state
+        if not s.tor.running: s.log_msg("WARN", "tor not running"); return
+        s.tor.new_circuit()
+
+    def cmd_tor_stop(self): self.state.tor.stop()
+
+    def cmd_health(self):
+        s = self.state
+        if s.health.running: s.log_msg("WARN", "health running"); return
+        s.health.start()
+
+    def cmd_health_stop(self):
+        s = self.state
+        if not s.health.running: s.log_msg("WARN", "health not running"); return
+        s.health.stop()
+
+    def cmd_session(self):
+        s = self.state
+        sid = s.session.start_session(name=f"sess-{int(time.time())}")
+        s.log_msg("OK", f"session #{sid} started")
+
+    def cmd_export(self):
+        s = self.state
+        if not s.session.session_id:
+            s.log_msg("WARN", "no active session"); return
+        path = HOME_DIR / f"session_{s.session.session_id}.json"
+        try:
+            s.session.export_json(s.session.session_id, str(path))
+            s.log_msg("OK", f"exported → {path}")
+        except Exception as e: s.log_msg("ERR", f"export: {e}")
+
+    def cmd_save_profile(self):
+        s = self.state
+        if not s.chain_strings:
+            s.log_msg("WARN", "no chain to save"); return
+        name = f"profile-{int(time.time())}"
+        self.profiles.save_profile(name, s.chain_strings, s.chain_hops)
+        s.log_msg("OK", f"saved profile '{name}'")
+
+    def cmd_load_profile(self):
+        s = self.state
+        profs = self.profiles.list_profiles()
+        if not profs:
+            s.log_msg("WARN", "no profiles saved"); return
+        name = profs[-1]
+        p = self.profiles.load_profile(name)
+        if not p: return
+        s.working = list(p["chain"]); s.chain_hops = p["hops"]
+        s.log_msg("OK", f"loaded profile '{name}'")
+
+    def cmd_reload(self): self._load_proxies()
+
+    def cmd_clear(self):
+        with self.state.lock: self.state.log.clear()
+        self.state.log_msg("INFO", "logs flushed")
+
+    def cmd_open_dir(self):
+        """Print + try to open HOME_DIR in file manager."""
+        s = self.state
+        s.log_msg("INFO", f"home: {HOME_DIR}")
+        s.log_msg("INFO", f"config: {CONFIG_FILE}")
+        s.log_msg("INFO", f"proxies: {self._proxy_path()}")
+        s.log_msg("INFO", f"sessions: {DB_FILE}")
+        try:
+            if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+                for cmd in (["xdg-open", str(HOME_DIR)],
+                            ["nautilus", str(HOME_DIR)],
+                            ["dolphin", str(HOME_DIR)]):
+                    try:
+                        subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                        s.log_msg("OK", "opened file manager"); break
+                    except Exception: continue
+        except Exception: pass
+
+    def cmd_quit(self): self.state.should_quit = True
+
+    def _handle(self, k):
+        if k in ("q", "Q", "\x03"): return False
+        if k == "\x1b[A": self.menu_idx = (self.menu_idx - 1) % len(self.menu)
+        elif k == "\x1b[B": self.menu_idx = (self.menu_idx + 1) % len(self.menu)
+        elif k in ("\r", "\n"):
+            _, fn = self.menu[self.menu_idx]
+            threading.Thread(target=fn, daemon=True).start()
+        elif k == "k": self.cmd_kill()
+        elif k == "r": self.cmd_reload()
+        elif k == "c": self.cmd_clear()
+        elif k == "t":
+            threading.Thread(target=self.cmd_tor_start, daemon=True).start()
+        elif k == "n": self.cmd_tor_new()
+        elif k in "123456789":
+            i = int(k) - 1
+            if 0 <= i < len(self.menu):
+                self.menu_idx = i
+                threading.Thread(target=self.menu[i][1], daemon=True).start()
+        elif k == "0":
+            i = 9
+            if 0 <= i < len(self.menu):
+                self.menu_idx = i
+                threading.Thread(target=self.menu[i][1], daemon=True).start()
+        return True
+
+    def run(self):
+        s = self.state
+        self.boot_sequence()
+        if s.should_quit: return
+        with Live(self._render(), console=self.console,
+                  refresh_per_second=FPS, screen=True) as live:
+            self.kr.start()
+            try:
+                while not s.should_quit:
+                    k = self.kr.read(1 / FPS)
+                    if k is not None and not self._handle(k): break
+                    live.update(self._render())
+            finally:
+                self.kr.stop()
+                if s.chain_server:
+                    try: s.chain_server.stop()
+                    except Exception: pass
+                if s.dns_bridge.running: s.dns_bridge.stop()
+                if s.health.running: s.health.stop()
+                if s.tor.running: s.tor.stop()
+                if s.kill_switch: s.kill.disarm(silent=True)
+                if s.transparent: s.netns.stop()
+                s.session.close()
+                try: PORT_FILE.unlink()
+                except Exception: pass
+        self.console.clear()
+        self.console.print(f"[b {C['ok']}]{APP} v{VER} terminated.[/]")
+
+
+def main():
+    # extra safety: resolve symlinks so we always find sibling modules
+    _real = Path(__file__).resolve().parent
+    if str(_real) not in sys.path:
+        sys.path.insert(0, str(_real))
+    try:
+        AnonChain().run()
+    except KeyboardInterrupt:
+        print("\n[!] interrupted")
+    except Exception as e:
+        import traceback; traceback.print_exc(); sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

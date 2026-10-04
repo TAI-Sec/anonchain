@@ -1,0 +1,45 @@
+.TH ANONCHAIN 1 "2026" "anonchain 1.0" "User Commands"
+.SH NAME
+anonchain \- multi-hop chain proxy interface + tool launcher
+.SH SYNOPSIS
+.B anonchain
+.RI [ command " [" args ...]"]
+.SH DESCRIPTION
+ANONCHAIN is a chain proxy interface. Without arguments it opens a
+terminal UI to test proxies, build a multi-hop chain and arm an
+iptables kill-switch. With arguments it runs the given command
+through the active chain.
+.SH USAGE
+.TP
+.B anonchain
+Open the TUI.
+.TP
+.B anonchain curl https://ifconfig.me
+Run curl through the active chain (HTTP_PROXY + LD_PRELOAD).
+.TP
+.B anonchain nmap -sT -Pn scanme.nmap.org
+Run nmap; TCP connect is tunneled via SOCKS5 LD_PRELOAD shim.
+.SH ENVIRONMENT
+.TP
+.B ANONCHAIN_PORT
+Local chain proxy port (default 9050).
+.TP
+.B ANONCHAIN_PRELOAD
+auto|on|off — control LD_PRELOAD shim (default auto).
+.TP
+.B ANONCHAIN_RESOLVE
+1|0 — force getaddrinfo through local DoH DNS bridge.
+.SH FILES
+.TP
+.I ~/.anonchain/config.toml
+User config and profiles.
+.TP
+.I ~/.anonchain/sessions.db
+SQLite session log.
+.TP
+.I /tmp/anonchain.port
+Current chain port (auto-managed).
+.SH SEE ALSO
+.BR proxychains4 (1),
+.BR tor (1),
+.BR iptables (8)

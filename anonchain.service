@@ -1,0 +1,19 @@
+[Unit]
+Description=ANONCHAIN chain proxy interface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 /usr/local/lib/anonchain/anonchain.py
+Restart=on-failure
+RestartSec=5
+User=%i
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-write
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

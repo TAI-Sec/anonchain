@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# anonchain launcher — works from any CWD, any user.
+set -e
+
+# --- locate the library ---
+LIB="/usr/local/lib/anonchain"
+# dev fallback: if installed lib missing, use script's own dir
+if [[ ! -f "$LIB/anonchain.py" ]]; then
+    SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    if [[ -f "$SELF_DIR/anonchain.py" ]]; then
+        LIB="$SELF_DIR"
+    else
+        echo "[anonchain] cannot find anonchain.py (checked $LIB and $SELF_DIR)" >&2
+        exit 1
+    fi
+fi
+
+PY="$(command -v python3)"
+[[ -z "$PY" ]] && { echo "[anonchain] python3 missing" >&2; exit 1; }
+
+# --- TUI mode ---
+if [[ $# -eq 0 ]]; then
+    exec "$PY" "$LIB/anonchain.py" "$@"
+fi
+
+# --- resolve home (respect env override) ---
+if [[ -n "${ANONCHAIN_HOME:-}" ]]; then
+    HOME_DIR="$ANONCHAIN_HOME"
+elif [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    HOME_DIR="$XDG_CONFIG_HOME/anonchain"
+else
+    HOME_DIR="$HOME/.anonchain"
+fi
+mkdir -p "$HOME_DIR" 2>/dev/null || true
+
+# --- find chain port ---
+PORT_FILE="/tmp/anonchain.$(id -u).port"
+PORT=9050
+[[ -f "$PORT_FILE" ]] && PORT="$(cat "$PORT_FILE" 2>/dev/null || echo 9050)"
+
+if ! (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then
+    echo "[anonchain] chain not listening on 127.0.0.1:$PORT" >&2
+    echo "[anonchain] start the TUI and run 'Assemble Chain'" >&2
+    exit 1
+fi
+exec 3<&- 3>&-
+
+# --- export env for HTTP-aware tools ---
+export http_proxy="http://127.0.0.1:$PORT"
+export https_proxy="http://127.0.0.1:$PORT"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+export ALL_PROXY="$http_proxy"
+export all_proxy="$ALL_PROXY"
+export ANONCHAIN_PORT="$PORT"
+export ANONCHAIN_RESOLVE="${ANONCHAIN_RESOLVE:-1}"
+export NO_PROXY="" no_proxy=""
+
+# --- LD_PRELOAD for non-HTTP tools ---
+SO="$LIB/anonchain_preload.so"
+PRELOAD_FLAG="${ANONCHAIN_PRELOAD:-auto}"
+if [[ -f "$SO" && "$PRELOAD_FLAG" != "off" ]]; then
+    export LD_PRELOAD="$SO${LD_PRELOAD:+:$LD_PRELOAD}"
+    echo "[anonchain] LD_PRELOAD active" >&2
+fi
+
+echo "[anonchain] routing: $*  →  127.0.0.1:$PORT" >&2
+exec "$@"

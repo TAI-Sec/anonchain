@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anonchain"
+version = "1.0.0"
+description = "Multi-hop chain proxy interface + tool launcher"
+requires-python = ">=3.10"
+dependencies = ["rich", "requests", "urllib3", "psutil", "tomli-w"]
+
+[project.scripts]
+anonchain = "anonchain:main"
+
+[tool.setuptools]
+py-modules = ["anonchain", "chain_engine", "killswitch", "doh",
+              "dns_bridge", "tor_manager", "scraper", "health",
+              "profiles", "session_db", "netns"]
