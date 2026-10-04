@@ -92,7 +92,7 @@ ANONCHAIN turns a list of proxy endpoints into a working multi-hop chain, then l
 ## Installation
 
 ```bash
-git clone <repo> anonchain
+git clone https://github.com/TAI-Sec/anonchain.git
 cd anonchain
 chmod +x install.sh anonchain.py sos.py
 ./install.sh
